@@ -16,7 +16,7 @@ from pathlib import Path
 from solution.config import ConfigError
 from solution.security import Crypto, DecryptionError
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS events (
     event_type       TEXT NOT NULL,
     workflow_id      TEXT,
     call_id          TEXT,
-    occurred_us      INTEGER NOT NULL,
+    occurred_us      INTEGER,            -- NULL when occurred_at is unparseable
     phone_state      TEXT NOT NULL CHECK (phone_state IN ('none','invalid','valid')),
     phone_hash       BLOB,
     disposition_code TEXT,

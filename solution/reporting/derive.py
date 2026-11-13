@@ -24,16 +24,25 @@ _LINK_STEPS = [
               e.disposition_code AS disposition_code, l.id AS lead_id
        FROM events e JOIN leads l ON l.workflow_id = e.workflow_id AND l.phone_hash = e.phone_hash
        WHERE e.phone_state = 'valid'""",
-    # 2. a call's lead as seen through its phone-bearing events.
+    # 2. a call's lead, as seen through its phone-linked events: the lead of its EARLIEST linked,
+    #    TIMED call.initiated (ties: event_id). If the call has no timed initiated, the lead of its
+    #    earliest linked event overall (timed before untimed, ties: event_id) - an untimed
+    #    call.initiated gets no priority; it is just another event.
     """CREATE TEMP TABLE call_lead AS
-       SELECT workflow_id, call_id, MIN(lead_id) AS lead_id
-       FROM ev_lead WHERE call_id IS NOT NULL GROUP BY workflow_id, call_id""",
-    # 3. events with no phone at all (overrides) link through their call_id.
+       SELECT workflow_id, call_id, lead_id FROM (
+         SELECT workflow_id, call_id, lead_id,
+                ROW_NUMBER() OVER (PARTITION BY workflow_id, call_id
+                                   ORDER BY (NOT (event_type = 'call.initiated'
+                                                  AND occurred_us IS NOT NULL)),
+                                            (occurred_us IS NULL), occurred_us, event_id) AS rn
+         FROM ev_lead WHERE call_id IS NOT NULL) WHERE rn = 1""",
+    # 3. ONLY disposition.override may link through call_id (spec: it carries no phone). Every other
+    #    phone-less event cannot be linked and stays an orphan.
     """INSERT INTO ev_lead
        SELECT e.id, e.workflow_id, e.call_id, e.event_type, e.occurred_us, e.event_id,
               e.disposition_code, cl.lead_id
        FROM events e JOIN call_lead cl ON cl.workflow_id = e.workflow_id AND cl.call_id = e.call_id
-       WHERE e.phone_state = 'none'""",
+       WHERE e.phone_state = 'none' AND e.event_type = 'disposition.override'""",
     "CREATE INDEX temp.ix_ev_lead_call ON ev_lead(workflow_id, call_id)",
 ]
 
@@ -44,7 +53,8 @@ _CALL_STEPS = [
          SELECT workflow_id, call_id, lead_id, occurred_us,
                 ROW_NUMBER() OVER (PARTITION BY workflow_id, call_id
                                    ORDER BY occurred_us, event_id) AS rn
-         FROM ev_lead WHERE event_type = 'call.initiated' AND call_id IS NOT NULL) WHERE rn = 1""",
+         FROM ev_lead WHERE event_type = 'call.initiated' AND call_id IS NOT NULL
+                        AND occurred_us IS NOT NULL) WHERE rn = 1""",
     "CREATE UNIQUE INDEX temp.ux_calls ON calls(workflow_id, call_id)",
     # 5. effective disposition: latest known override, else latest known set.
     #    Unknown codes are ignored; events of the call linked to a different lead are ignored.
@@ -58,6 +68,7 @@ _CALL_STEPS = [
          JOIN calls c ON c.workflow_id = x.workflow_id AND c.call_id = x.call_id
                      AND c.lead_id = x.lead_id
          WHERE x.event_type IN ('disposition.set', 'disposition.override')
+           AND x.occurred_us IS NOT NULL
            AND EXISTS (SELECT 1 FROM dispositions d
                        WHERE d.workflow_id = x.workflow_id AND d.code = x.disposition_code))
        WHERE rn = 1""",

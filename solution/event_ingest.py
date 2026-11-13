@@ -1,6 +1,6 @@
 """Event JSONL ingestion into the append-only ledger.
 
-Per-line pipeline (spec order): malformed -> duplicate -> (orphan, derived later)
+Per-line pipeline (spec order): malformed (bad JSON / no event_id) -> duplicate -> (orphan, derived later)
 -> (unknown disposition, derived later).  Orphan and unknown-disposition status is
 *not* decided here because it depends on which leads exist; the ledger keeps every
 valid, non-duplicate event and reports derive the rest from current state.
@@ -40,9 +40,13 @@ def _clean_str(v: object) -> str | None:
 def parse_event_line(raw: bytes, crypto: Crypto, line_no: int, source_file_id: int) -> tuple | None:
     """Return an INSERT row for ``events`` or ``None`` if the line is malformed.
 
-    Malformed = not valid UTF-8/JSON, not a JSON object, no event_id, no event_type, or an
-    unparseable ``occurred_at`` (the last two are our extension: such an event can be neither
-    ordered nor interpreted).
+    Exactly the spec's definition: the line is not valid JSON (or not a JSON object, which
+    cannot carry an ``event_id``), or it has no ``event_id``.  Everything else is a real event
+    and goes through dedupe / orphan / unknown-disposition handling:
+    * a missing ``event_type`` is stored as '' (inert: it matches no known type);
+    * an unparseable ``occurred_at`` is stored as NULL - the event still counts for dedupe,
+      linking and orphan statistics but cannot be ordered, so it never creates or dates a call
+      and never decides an effective disposition.
     """
     try:
         obj = json.loads(raw.decode("utf-8"))
@@ -51,10 +55,10 @@ def parse_event_line(raw: bytes, crypto: Crypto, line_no: int, source_file_id: i
     if not isinstance(obj, dict):
         return None
     event_id = _clean_str(obj.get("event_id"))
-    event_type = _clean_str(obj.get("event_type"))
-    occurred_us = parse_timestamp_us(obj.get("occurred_at"))
-    if event_id is None or event_type is None or occurred_us is None:
+    if event_id is None:
         return None
+    event_type = _clean_str(obj.get("event_type")) or ""
+    occurred_us = parse_timestamp_us(obj.get("occurred_at"))
 
     payload = obj.get("payload")
     if not isinstance(payload, dict):

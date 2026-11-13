@@ -151,57 +151,73 @@ def run(drop_dirs: list[Path], schemas_dir: Path) -> dict[str, str]:
                 try:
                     e = json.loads(line)
                     assert isinstance(e, dict) and e.get("event_id")
-                    _ts(e["occurred_at"])
                 except Exception:
-                    malformed += 1
+                    malformed += 1                  # spec: bad JSON or no event_id - nothing else
                     continue
                 if e["event_id"] in seen:
                     dups += 1
                     continue
                 seen.add(e["event_id"])
+                try:
+                    e["_ts"] = _ts(e["occurred_at"])
+                except Exception:
+                    e["_ts"] = None                 # still a valid event; just cannot be ordered
+                e["event_type"] = e.get("event_type") or ""
+                e["payload"] = e.get("payload") if isinstance(e.get("payload"), dict) else {}
                 evs.append(e)
 
-    call_lead = {}
-    for e in evs:
+    def phone_key(e):
         ph = e.get("phone")
-        if ph and _phone(str(ph)) and (e["workflow_id"], _phone(str(ph))) in leads:
-            call_lead.setdefault((e["workflow_id"], e["call_id"]), (e["workflow_id"], _phone(str(ph))))
+        if ph is None or str(ph).strip() == "":
+            return "none"
+        p = _phone(str(ph))
+        return (e.get("workflow_id"), p) if p and (e.get("workflow_id"), p) in leads else "orphan"
+
+    # phone-linked events first; then the call's lead = lead of its EARLIEST linked call.initiated
+    # (else its earliest linked event); only disposition.override may link through call_id.
+    linked_by_phone = [(phone_key(e), e) for e in evs]
+    linked_by_phone = [(k, e) for k, e in linked_by_phone if k not in ("none", "orphan")]
+    call_lead = {}
+    ordered = sorted(linked_by_phone, key=lambda t: (
+        not (t[1]["event_type"] == "call.initiated" and t[1]["_ts"] is not None),
+        t[1]["_ts"] is None,
+        t[1]["_ts"] or datetime.min.replace(tzinfo=timezone.utc), t[1]["event_id"]))
+    for k, e in ordered:
+        if e.get("call_id"):
+            call_lead.setdefault((e["workflow_id"], str(e["call_id"])), k)
     linked, orphans, unknown = [], 0, 0
     for e in evs:
-        ph = e.get("phone")
-        key = None
-        if ph:
-            p = _phone(str(ph))
-            if p and (e["workflow_id"], p) in leads:
-                key = (e["workflow_id"], p)
-        else:
-            key = call_lead.get((e["workflow_id"], e["call_id"]))
-        if key is None:
+        k = phone_key(e)
+        if k == "none" and e["event_type"] == "disposition.override":
+            k = call_lead.get((e.get("workflow_id"), str(e.get("call_id"))), "orphan")
+        if k in ("none", "orphan"):
             orphans += 1
             continue
-        if e["event_type"].startswith("disposition.") and \
-                (e["workflow_id"], e["payload"].get("disposition_code")) not in disp:
+        if e["event_type"].startswith("disposition.") and                 (e["workflow_id"], e["payload"].get("disposition_code")) not in disp:
             unknown += 1
             continue
-        linked.append((key, e))
+        linked.append((k, e))
 
     calls = {}
     for key, e in linked:
-        if e["event_type"] == "call.initiated":
-            calls.setdefault((e["workflow_id"], e["call_id"]), {"lead": key, "evs": []})
+        if e["event_type"] == "call.initiated" and e["_ts"] is not None:
+            cur = calls.get((e["workflow_id"], e["call_id"]))
+            if cur is None or (e["_ts"], e["event_id"]) < cur["first"]:
+                calls[(e["workflow_id"], e["call_id"])] = {"lead": key, "evs": [],
+                                                           "first": (e["_ts"], e["event_id"])}
     for key, e in linked:
         c = calls.get((e["workflow_id"], e["call_id"]))
         if c and c["lead"] == key:
             c["evs"].append(e)
     for (wf, _), c in calls.items():
-        init = min(_ts(e["occurred_at"]) for e in c["evs"] if e["event_type"] == "call.initiated")
-        c["init"] = init
+        c["init"] = c["first"][0]
         c["connected"] = any(e["event_type"] == "call.connected" for e in c["evs"])
         c["tfailed"] = any(e["event_type"] == "call.telephony_failed" for e in c["evs"])
-        ov = [e for e in c["evs"] if e["event_type"] == "disposition.override"]
-        st = [e for e in c["evs"] if e["event_type"] == "disposition.set"]
+        timed = [e for e in c["evs"] if e["_ts"] is not None]
+        ov = [e for e in timed if e["event_type"] == "disposition.override"]
+        st = [e for e in timed if e["event_type"] == "disposition.set"]
         pool = ov or st
-        c["disp"] = max(pool, key=lambda e: (_ts(e["occurred_at"]), e["event_id"]))["payload"][
+        c["disp"] = max(pool, key=lambda e: (e["_ts"], e["event_id"]))["payload"][
             "disposition_code"] if pool else None
         c["term"] = bool(c["disp"]) and disp[(wf, c["disp"])][0]
         c["succ"] = bool(c["disp"]) and disp[(wf, c["disp"])][1]
