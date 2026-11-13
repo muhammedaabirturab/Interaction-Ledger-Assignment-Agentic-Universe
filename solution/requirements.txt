@@ -1,0 +1,4 @@
+# Runtime + test dependencies for Assignment A (everything else is the Python standard library).
+# Tested with: Python 3.11.9, SQLite 3.45.1, cryptography 50.0.2, pytest 9.2.0.
+cryptography>=42,<52   # AES-256-GCM (authenticated encryption); HMAC/hashlib/sqlite3/csv/json are stdlib
+pytest>=8

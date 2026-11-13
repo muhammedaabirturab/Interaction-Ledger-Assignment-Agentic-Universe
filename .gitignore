@@ -9,3 +9,17 @@ data_large/
 reports/
 final_state.csv
 .pytest_cache/
+
+# --- solution hygiene ---
+.env.*
+!.env.example
+ledger.db
+*.db-wal
+*.db-shm
+*.db-journal
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+*.egg-info/
+.coverage
