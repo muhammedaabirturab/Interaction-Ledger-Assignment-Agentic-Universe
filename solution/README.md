@@ -1,51 +1,138 @@
 # Assignment A solution: Interaction Ledger & Reporting Pipeline
 
-A small, dependency-light pipeline that ingests messy lead CSVs and call-event JSONL "drops" into
-SQLite, protects PII at rest, and produces the five client reports. All business rules follow
-`assignment-a-data/README.md`; the choices the spec left open are listed in `../SUBMISSION.md`.
+**Start here.** This file is the technical guide to the solution. Where things are:
 
-* Python 3.11+ (needs `datetime.fromisoformat` handling of `Z`), SQLite 3.25+ (window functions).
-* One third-party dependency: `cryptography` (AES-256-GCM). No ORM, no pandas — see "Why".
+| File | What it is |
+|---|---|
+| `README.md` (repo root) | The original assignment brief from Agentic Universe, deliberately left unmodified. |
+| `assignment-a-data/README.md` | The Assignment A specification (the business rules this solution implements). |
+| **`solution/README.md`** (this file) | How to install, run, test and understand the solution. |
+| [`SUBMISSION.md`](../SUBMISSION.md) | Design summary, every decision/assumption the spec left open, failure modes, test results, performance. |
+| [`AI_USAGE.md`](../AI_USAGE.md) | Disclosure of how AI was used and how the output was verified. |
 
-## Quick start (from a clean clone)
+## What it does
 
-```bash
+A pipeline that ingests messy **lead CSV** uploads and **call-event JSONL** drops into SQLite, keeps customer PII
+out of plaintext, maintains an **append-only interaction ledger**, and produces the five client reports
+(`batch_summary.csv`, `daily_overview.csv`, `lead_report.csv`, `rejections.csv`, `data_quality.json`).
+It is **idempotent** (re-ingesting a drop changes nothing) and **incremental** (drop 1 then drop 2 gives exactly the
+reports of ingesting everything at once). Events that arrive before their lead are kept and attach automatically
+when the lead arrives.
+
+## Prerequisites
+
+* **Python 3.11 or newer** (`datetime.fromisoformat` must accept `Z` timestamps) and `pip`.
+* SQLite 3.25+ (window functions) — bundled with Python.
+* One third-party runtime dependency: `cryptography` (AES-256-GCM). `pytest` for tests. Pinned ranges and the tested
+  versions are in `solution/requirements.txt`. No Docker or Postgres is needed (SQLite is used).
+
+Verified on Windows 11 with Python 3.11.9 / SQLite 3.45.1 / cryptography 50.0.2 / pytest 9.2.0. The Linux/macOS commands
+below use only standard tooling but were **not** run on those systems.
+
+## Setup and run (from a clean clone, repo root)
+
+<details open><summary><b>Windows PowerShell</b></summary>
+
+```powershell
 python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
-pip install -r solution/requirements.txt
+.\.venv\Scripts\Activate.ps1          # if blocked: Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+python -m pip install -r solution/requirements.txt
 
-# 1. keys (two different secrets; never commit them)
-python -m solution gen-keys > .env   # writes LEDGER_ENCRYPTION_KEY=... and LEDGER_HMAC_KEY=... (see .env.example)
+# keys: two different secrets, written to the git-ignored .env  (-Encoding ascii matters, see Troubleshooting)
+python -m solution gen-keys | Out-File -Encoding ascii .env
 
-# 2. data (generated, git-ignored)
 python assignment-a-data/tools/generate_data.py --seed 42 --scale small --out data
-
-# 3. run
 python -m solution ingest data/drop_1
 python -m solution ingest data/drop_2
 python -m solution report --out reports/
-
-# 4. tests
-pytest
 ```
+</details>
 
-`.env` is read from the current directory (real environment variables win). Use a fresh database
-per dataset: delete `ledger.db` (or pass `--db other.db`) before ingesting a *different* seed,
-because a ledger is cumulative by design.
+<details open><summary><b>Linux / macOS (bash)</b></summary>
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r solution/requirements.txt
+
+python -m solution gen-keys > .env     # two different secrets, written to the git-ignored .env
+
+python assignment-a-data/tools/generate_data.py --seed 42 --scale small --out data
+python -m solution ingest data/drop_1
+python -m solution ingest data/drop_2
+python -m solution report --out reports/
+```
+</details>
+
+Notes:
+
+* Run everything from the repository root. `.env` is read from the current directory; real environment
+  variables take precedence. Instead of `.env` you can set `LEDGER_ENCRYPTION_KEY` and `LEDGER_HMAC_KEY` directly
+  (PowerShell: `$env:LEDGER_HMAC_KEY = "..."`). `.env.example` shows the format with placeholders only.
+* `python -m solution ingest data` (the parent folder) ingests `drop_1` then `drop_2` in one command — the
+  result is identical to two separate commands.
+* The database is `./ledger.db` (override with `--db PATH` or `LEDGER_DB`). **A ledger is cumulative**: use a new
+  `--db` (or delete `ledger.db`) before ingesting a *different* dataset or seed.
+* `ledger.db`, `.env`, `data/` and `reports/` are git-ignored. Never commit them.
 
 ### Commands
 
 | Command | Purpose |
 |---|---|
-| `python -m solution ingest <path>` | `<path>` is one drop (`leads/`, `events/`) or a folder of drops (ingested in natural name order: `ingest data` == `drop_1` then `drop_2`). |
-| `python -m solution report --out <dir>` | Writes the five files from everything ingested so far. |
+| `python -m solution ingest <path> [--schemas DIR]` | `<path>` is one drop (has `leads/` and/or `events/`) or a folder of drops (ingested in natural name order). Prints a count summary, never row values. |
+| `python -m solution report --out <dir>` | Writes the five files from everything ingested so far (creates `<dir>`). Needs the DB and both keys. |
 | `python -m solution init-db` | Creates the DB and registers the key fingerprints. |
-| `python -m solution gen-keys` | Prints two fresh random keys. |
-| global flags | `--db PATH` (or `$LEDGER_DB`, default `./ledger.db`), `-v` (log each file), `--schemas DIR` on `ingest` (or `$LEDGER_SCHEMAS_DIR`). |
+| `python -m solution gen-keys` | Prints two fresh random keys (`LEDGER_ENCRYPTION_KEY=…`, `LEDGER_HMAC_KEY=…`). |
+| top-level options (go **before** the sub-command) | `--db PATH` (default `$LEDGER_DB` or `./ledger.db`), `-v` (log each file), `--version`. Example: `python -m solution --db other.db -v ingest data`. |
 
-Exit codes: `0` ok, `1` runtime/ingest failure (corrupt file, wrong key for stored data, I/O),
-`2` configuration/usage error (missing/invalid keys, bad path, unknown workflow folder, DB missing for
-`report`). Output and logs contain counts and file names only, never row values.
+Exit codes: `0` ok · `1` runtime/ingest failure (corrupt file, stored data fails authentication, I/O) · `2` configuration
+or usage error (missing/invalid/identical keys, keys not matching the DB, bad path, unknown workflow folder, no DB for
+`report`).
+
+## Expected output
+
+After the commands above with seed 42 (`--scale small`), `reports/` contains:
+
+| File | Content | Rows (seed 42) |
+|---|---|---|
+| `batch_summary.csv` | per `(workflow_id, batch_id)`: `total_leads` and the four bucket counts | 6 |
+| `daily_overview.csv` | per workflow and IST date with ≥1 call: `total_calls`, `connected_calls`, `connectivity_rate` (4 d.p.), `success_leads` | 33 |
+| `lead_report.csv` | one row per lead: masked phone (`+91******NNNN`), bucket, call counts, `last_call_at` (IST), current disposition, `ever_success` | 1,892 |
+| `rejections.csv` | `workflow_id,batch_id,row_number,reason` — **no PII** | 108 |
+| `data_quality.json` | counters (see below) | — |
+
+`data_quality.json` for seed 42 small (any correct run of the same seed must match exactly):
+
+```json
+{"lead_rows_total": 2057, "lead_rows_rejected": 108,
+ "rejections_by_reason": {"invalid_phone": 42, "missing_required:customer_name": 25, "missing_required:order_id": 13,
+                          "missing_required:phone": 14, "missing_required:policy_number": 14},
+ "duplicate_lead_rows_merged": 57, "field_warnings": 122, "events_total": 8745, "malformed_events": 8,
+ "duplicate_events_dropped": 237, "orphan_events": 462, "unknown_disposition_events": 18}
+```
+
+(The file itself is pretty-printed.) Re-running `ingest` on the same drops prints `files ingested: 0 … skipped (already
+ingested)`; running `report` again rewrites byte-identical files.
+
+## Tests and verification
+
+```bash
+python -m pytest                      # 155 tests, about 30-90 s depending on the machine
+python solution/tools/verify_seeds.py 1111 2222 3333 4444 5555 6666 7777 8888
+python solution/tools/verify_seeds.py 4242 --scale large      # optional: several minutes, uses a temp folder
+```
+
+(Same commands in PowerShell and bash.) `verify_seeds.py` generates a **fresh** dataset per seed and checks that
+(1) incremental ingest == one-shot ingest, (2) both equal the independent oracle `solution/tests/oracle.py`
+byte-for-byte on all five files, (3) re-ingest is a no-op and (4) reports are stable. It prints `PASS`/`FAIL` per seed and exits
+non-zero on any failure.
+
+What the 155 tests cover: phone/date/decimal/header/timestamp rules; rejection order and row numbering;
+merge/last-write-wins and defaults; event linking, orphans arriving before leads, effective dispositions, buckets,
+IST date rollover, call attribution edge cases; idempotent re-ingest, restart, injected crash and a real process kill;
+append-only triggers; empty/corrupt files; key validation and tampered ciphertext; **no plaintext PII in the database
+files**; CLI exit codes and PII-free output; and differential tests against the oracle. The oracle is a second
+implementation by the same author, so it is evidence of internal consistency rather than an independent authority.
 
 ## Architecture
 
@@ -63,106 +150,72 @@ solution/
   reporting/
     derive.py       SQL that derives links, calls, dispositions, buckets (temp tables)
     writers.py      the five report files
-  tests/            145 tests incl. an independent oracle (tests/oracle.py)
+  tools/verify_seeds.py   fresh-seed verification script
+  tests/            155 tests + oracle.py (independent reference implementation)
 ```
 
-Data flow:
-
 ```
- lead CSV  --normalise/validate--> leads + lead_fields (PII encrypted) / lead_rejections
- event JSONL --parse/dedupe-----> events (append-only; phone stored only as HMAC)
-                                     |
-   report: events JOIN leads (workflow + phone HMAC, or call_id for phone-less overrides)
-           -> ev_lead -> calls -> call_facts/call_disp -> lead_facts -> 5 report files
+ lead CSV    --normalise/validate--> leads + lead_fields (PII encrypted) / lead_rejections
+ event JSONL --parse/dedupe-------> events (append-only; phone stored only as an HMAC)
+                                       |
+ report: events JOIN leads on (workflow, phone HMAC)  [phone-less disposition.override: via its call]
+         -> ev_lead -> calls -> call_facts / call_disp -> lead_facts -> the 5 files
 ```
 
-## Database design
+### Database
 
 | Table | Role | Keys / constraints |
 |---|---|---|
-| `workflows`, `dispositions` | schema + catalogue loaded from `assignment-a-data/schemas` | PK `(workflow_id, code)` |
-| `ingest_runs` | audit of each run that changed something | |
+| `workflows`, `dispositions` | schemas + catalogue loaded from `assignment-a-data/schemas` | PK `(workflow_id, code)` |
+| `ingest_runs` | audit of each run that ingested something | |
 | `source_files` | one row per ingested file + its counters | **UNIQUE `(kind, workflow_id, sha256)`** = idempotency key |
-| `batches` | one per `(workflow_id, batch_id=file stem)` | PK; FK to first file |
-| `leads` | identity `(workflow_id, phone_hash)` | UNIQUE identity; FK to `batches`; `external_ref` (reference field, last-write-wins) |
-| `lead_fields` | non-null field values per lead (EAV, so any schema works) | PK `(lead_id, field_name)`; CHECK exactly one of `value_plain` / `value_enc` |
+| `batches` | one per `(workflow_id, batch_id = file stem)` | PK |
+| `leads` | identity `(workflow_id, phone_hash)`; `external_ref` | UNIQUE identity; FK to `batches` |
+| `lead_fields` | non-null field values (EAV, so any schema works) | PK `(lead_id, field_name)`; CHECK exactly one of `value_plain` / `value_enc` |
 | `lead_rejections` | `(file, row_number, reason)` — no values | UNIQUE `(source_file_id, row_number)` |
-| `events` | **append-only ledger** | UNIQUE `event_id`; `UPDATE`/`DELETE` blocked by triggers |
+| `events` | **append-only ledger** (`occurred_us` is NULL if the timestamp was unparseable) | UNIQUE `event_id`; UPDATE/DELETE blocked by triggers |
 
-Key decisions:
+### Key design decisions (full table with alternatives in [`SUBMISSION.md`](../SUBMISSION.md))
 
-* **Linkage is derived, not stored.** An event has no `lead_id` column. The event's lead is whatever
-  `(workflow_id, phone_hash)` currently matches (or, for phone-less overrides, the lead of its call's
-  other events). A lead that arrives later therefore resolves its orphans automatically, the ledger is never
-  updated, and "incremental == one-shot" holds by construction rather than by a reconciliation job.
-  Orphans are *retained* in `events`; they are simply excluded from reports and counted.
-* **No secondary indexes on `events`.** Reports scan the ledger once and probe `leads`'s unique index;
-  extra indexes only slowed the 600k-row append path (measured: removing them plus a cheaper orphan recount took `ingest drop_1` on the large set from ~74 s to ~20 s).
-* **File = transaction.** A file's rows and its `source_files` marker commit together, so a crash
-  (tested with a real `kill`) leaves the file wholly applied or not at all, and re-running retries it.
-* **EAV `lead_fields`** keeps one schema for every workflow and makes the "overwrite only non-null
-  fields" merge a single upsert per field.
+* **Event→lead links are derived at report time, never stored.** A late-arriving lead therefore picks up its earlier
+  events with no update to the ledger and no reconciliation job, and "incremental == one-shot" holds by construction.
+  Orphans stay in `events`; they are only excluded from reports and counted.
+* **Only `disposition.override` may link through `call_id`.** Every other event links by normalised phone; phone-less
+  or invalid-phone events are orphans. A call's lead is the lead of its earliest *timed* linked `call.initiated`
+  (ties: `event_id`), otherwise of its earliest linked event.
+* **One transaction per input file**, keyed by the file's SHA-256, so a crash leaves a file either fully applied or not at all.
+* **No secondary indexes on `events`**: reports scan the ledger once; extra indexes only slowed the append path.
+* **Raw `sqlite3`, no ORM/pandas**: bulk inserts plus set-based SQL; fewer dependencies and no 600k-row in-memory frames.
 
-## PII
+### PII
 
-Fields with `"pii": true` (`customer_name`, `phone`) are never stored in plaintext.
+Fields marked `"pii": true` (`customer_name`, `phone`) are never stored in plaintext.
 
-* `phone_hash = HMAC-SHA256(LEDGER_HMAC_KEY, "phone:v1:" + "+91XXXXXXXXXX")` — deterministic, so leads and
-  events match without the number being stored. Events keep *only* this hash (invalid/absent phones are
-  recorded as a state, nothing else).
-* Reversible values (name, phone, needed for `phone_masked`) are AES-256-GCM encrypted with
-  `LEDGER_ENCRYPTION_KEY`, random 96-bit nonce, and associated data `lead:<id>:<field>` so a ciphertext moved
-  to another row fails authentication.
-* Two independent keys; startup rejects missing, malformed, short or identical keys. A key fingerprint
-  stored in `meta` makes the pipeline refuse to run against a DB created with different keys (otherwise
-  hashes would silently stop matching).
-* Reports: only `+91******NNNN`. `rejections.csv` has no values. Logs/terminal: counts and file names.
-* Tests scan the raw `.db`/`-wal` bytes for every name and phone in the generated data (with a positive control).
+* `phone_hash = HMAC-SHA256(LEDGER_HMAC_KEY, "phone:v1:" + "+91XXXXXXXXXX")` — deterministic matching key; events
+  store **only** this hash.
+* Name and phone are AES-256-GCM encrypted (`LEDGER_ENCRYPTION_KEY`, random nonce, associated data `lead:<id>:<field>`).
+* Two independent keys; startup rejects missing, malformed, short or identical keys, and a key fingerprint stored in `meta`
+  makes the program refuse to open a database created with different keys.
+* Reports show only `+91******NNNN`; `rejections.csv`, logs and terminal output contain no row values.
 
-Honest limits: SQLite itself is not encrypted (column-level only); the HMAC space of Indian mobiles is
-small, so security rests entirely on keeping `LEDGER_HMAC_KEY` secret; event `payload` is stored verbatim,
-so free-text PII placed in a payload by an upstream system would be stored.
+## Known limitations
 
-## Idempotency & incremental processing
-
-* Each input file is keyed by `(kind, workflow, SHA-256 of bytes)`; already-seen files are skipped, so
-  re-running `ingest` (or ingesting the same event file twice, or in two drops) changes nothing — not even
-  an audit row.
-* Event dedupe is by `event_id` across all drops (first occurrence wins); duplicate lead rows are merged
-  deterministically in drop/file/row order.
-* Reports are pure functions of the DB, recomputed in SQL each time; they are byte-identical on an unchanged DB.
-* Drop-2 does not reprocess drop-1's files; only the report aggregation is recomputed (≈13 s on the large set).
-
-## Testing
-
-```bash
-pytest                    # 145 tests, ~30 s
-
-```
-
-* `tests/oracle.py` is an independent re-implementation of the spec (no shared code). Differential tests
-  compare all five report files byte-for-byte against it on 4 seeds in CI plus the large dataset, and
-  incremental vs one-shot ingest.
-* Rule tests: phone/date/decimal/header/timestamp edge cases, rejection ordering, blank-row numbering,
-  merge semantics, overrides, buckets, IST date rollover, orphans arriving first, unknown dispositions.
-* Robustness: re-ingest, restart, simulated crash mid-file, real `kill`, append-only triggers, empty/corrupt
-  files, wrong keys, tampered ciphertext, reversed 3000-call event stream, CLI exit codes.
+* SQLite is not encrypted at file level (column-level only); the HMAC input space (Indian mobiles) is small, so
+  security rests on keeping `LEDGER_HMAC_KEY` secret. Event `payload` is stored verbatim, so free-text PII placed there by an
+  upstream system would be stored.
+* One writer at a time; no Postgres path; a *changed* file re-sent under the same name is ingested as new data (no amend workflow).
+* Verified only on Windows 11; large-dataset timings vary a lot with machine load (see `SUBMISSION.md`).
+* The `.env` loader does not strip a UTF-8 byte-order mark (see Troubleshooting).
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `LEDGER_ENCRYPTION_KEY is not set` (exit 2) | create `.env` from `.env.example` or export both keys (`python -m solution gen-keys`). |
-| `configured keys do not match ... this database` | you changed keys; use the original keys or a new `--db`. |
-| `Database not found` on `report` | run `ingest` first, or pass the same `--db`. |
-| `no schema for workflow 'x'` | the `leads/<x>/` folder has no `x.json` in `assignment-a-data/schemas`. |
-| `not valid UTF-8` | the CSV is not UTF-8; re-export it as UTF-8 (nothing from that file is ingested). |
-| Numbers look doubled after switching datasets | the ledger is cumulative; delete `ledger.db` or use `--db`. |
-
-## Why these choices
-
-* **Raw `sqlite3` over SQLAlchemy/pandas:** the workload is bulk insert + set-based SQL; an ORM adds
-  overhead and indirection, and pandas would hold 600k events in memory. Fewer dependencies, faster, easier to audit.
-* **Derived links over a reconciliation job:** removes a whole class of ordering bugs (see above).
-* **SQL aggregation:** window functions pick the effective disposition, earliest `call.initiated`, and the
-  latest call deterministically (ties broken by event/call id).
+| `LEDGER_ENCRYPTION_KEY is not set` (exit 2) although `.env` exists | On Windows PowerShell 5.1, `gen-keys > .env` writes a UTF-8 BOM that the loader does not accept. Recreate it with `python -m solution gen-keys \| Out-File -Encoding ascii .env` (or save the file as plain UTF-8 **without** BOM), or set the two variables in the shell. |
+| `LEDGER_ENCRYPTION_KEY is not set` (no `.env`) | Create `.env` as shown above or export both keys. |
+| `configured keys do not match … this database` (exit 2) | You changed keys; use the original keys or a new `--db`. |
+| `Database not found` on `report` | Run `ingest` first, or pass the same `--db` (it is a top-level option, before `report`). |
+| `no schema for workflow 'x'` (exit 2) | `leads/<x>/` has no `x.json` in `assignment-a-data/schemas` (or pass `--schemas`). Nothing is ingested. |
+| `not valid UTF-8` (exit 1) | The CSV is not UTF-8; re-export it as UTF-8. Nothing from that file is ingested. |
+| `Database schema version … expected …` | `ledger.db` was made by an older build; delete it and re-ingest. |
+| Counts look doubled after switching datasets | The ledger is cumulative; delete `ledger.db` or use a new `--db`. |

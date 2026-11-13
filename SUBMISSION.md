@@ -3,22 +3,28 @@
 ## Candidate
 - **Name:** Muhammed Aabir Turabi (Global Academy of Technology, Bangalore — final-year CSE)
 - **Assignment chosen:** A (Data) — Interaction Ledger & Reporting Pipeline
-- **Time spent (honest estimate):** `<<< fill in your own number >>>`
+- **Time spent (honest estimate):** [candidate to fill in before submitting - not something the working session can know]
 
 ## How to run
-Full detail and troubleshooting: [`solution/README.md`](solution/README.md).
-```bash
-python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r solution/requirements.txt                  # only third-party dep: cryptography (+pytest)
-python -m solution gen-keys > .env                        # two different secrets; .env is git-ignored
+Full detail, expected output and troubleshooting: [`solution/README.md`](solution/README.md). Run from the repo root.
+
+Windows PowerShell:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r solution/requirements.txt         # only third-party dep: cryptography (+pytest)
+python -m solution gen-keys | Out-File -Encoding ascii .env   # two different secrets; .env is git-ignored
 
 python assignment-a-data/tools/generate_data.py --seed 42 --scale small --out data
 python -m solution ingest data/drop_1
 python -m solution ingest data/drop_2
 python -m solution report --out reports/
-pytest                                                    # 145 tests, ~30 s
+python -m pytest                                           # 155 tests
+python solution/tools/verify_seeds.py 1111 2222 3333       # fresh seeds: incremental == one-shot == oracle
 ```
-Use a fresh DB per dataset (`rm ledger.db` or `--db other.db`): a ledger is cumulative by design.
+Linux/macOS: same, with `python3 -m venv .venv && source .venv/bin/activate` and `python -m solution gen-keys > .env`
+(not run on those systems - see limitations). Use a fresh DB per dataset (delete `ledger.db` or pass `--db other.db`):
+a ledger is cumulative by design.
 
 ## Design
 **Stack:** Python 3.11, raw `sqlite3` (WAL), `cryptography` for AES-256-GCM, stdlib `hmac`/`csv`/`json`.
@@ -39,10 +45,11 @@ dispositions → per-lead facts, and Python only formats the five files.
 - `events` – the ledger. `UNIQUE(event_id)`, no PII (phone only as HMAC), `UPDATE`/`DELETE` blocked by triggers.
 
 **Key idea – links are derived, not stored.** `events` has no `lead_id`. An event's lead is the lead whose
-`(workflow_id, phone_hash)` matches; a phone-less override takes the lead of its call's other events. So
+`(workflow_id, phone_hash)` matches; a phone-less override takes the lead of its call (rule in the decisions table). So
 when drop 2 brings the lead, previously orphaned events link on the next report with *no* update to the
 ledger and no reconciliation job; "drop_1 then drop_2" and "everything at once" are equal by construction
-(and tested). Orphans stay in `events`; they are only excluded from reports and counted.
+(and tested). Only `disposition.override` events (which carry no phone) link through their call; every
+other phone-less event stays an orphan. Orphans stay in `events`; they are only excluded from reports and counted.
 
 **PII.** `phone_hash = HMAC-SHA256(hmac_key, "phone:v1:+91…")` for matching; name and phone are AES-256-GCM
 encrypted (random nonce, AAD = `lead:<id>:<field>`) because `phone_masked` needs the last four digits.
@@ -55,13 +62,13 @@ Tests scan the raw `.db`/`-wal` bytes for every generated name/phone.
 |---|---|---|
 | Idempotency key = SHA-256 of file bytes (per kind + workflow) | Re-ingest is a no-op even if the folder is renamed/copied; changed bytes are treated as new data | Key by path (breaks on rename; stale on edit) |
 | Event→lead link derived at query time | No mutable reconciliation state; order-independent | Store `lead_id` and back-fill on lead arrival (needs UPDATE on an append-only table) |
-| A call's lead = lead of its earliest linked `call.initiated`; other events count only if they link to that same lead | Cross-lead call_id collisions can't corrupt a call | Group by `call_id` only |
-| Phone-less events (any type) link via `call_id`; events with a present-but-invalid phone are orphans | Spec says events link via normalised phone; overrides are the stated exception | Fallback to call for invalid-phone events too |
+| A call's lead = lead of its earliest TIMED linked `call.initiated` (ties: `event_id`), else of its earliest linked event overall (timed before untimed, ties: `event_id`) - an untimed `call.initiated` gets no priority; a phone-less override takes that lead; other events count towards the call only if they link to that same lead | One rule for linking overrides AND attributing calls, so conflicting `call_id` collisions cannot split a call between leads (regression-tested) | `MIN(lead_id)` over the call's events (my first version - inconsistent with the call attribution; fixed in review) |
+| ONLY `disposition.override` may link through `call_id`, and only when it has no phone. Every other event type links via its normalised phone; phone-less or invalid-phone events are orphans | Spec: events link via `(workflow_id, phone)`; the override is the one stated exception (my first version linked every phone-less event - fixed in review) | Fallback to the call for every phone-less event |
 | Override beats any set regardless of time; latest by `occurred_at`, ties by `event_id` | Spec: "latest override, else latest set" | Latest of both |
 | Unknown-code disposition events are ignored for the *effective* disposition (a bad override doesn't hide a good set) | "count it and ignore it" | Treat as clearing the disposition |
 | Orphan / unknown-disposition counts computed from final state, orphan checked before unknown | Spec step order + "reflect the final state" | Count at ingest time |
-| `malformed` also covers: non-object JSON, missing `event_type`, unparseable `occurred_at` | Such an event cannot be ordered or interpreted; spec only names bad JSON/no `event_id` | New counter (the JSON contract has no slot for it) |
-| Unknown `event_type` is stored and inert (not malformed/orphan unless unlinkable) | Never lose a valid event | Count as malformed |
+| `malformed` = invalid JSON, or no usable `event_id` (a JSON value that is not an object has none) - nothing else | Exact spec contract (my first version also flagged missing `event_type` / bad `occurred_at`, which could shift `malformed_events`, `orphan_events` and `duplicate_events_dropped` - fixed in review) | Extra malformed categories |
+| Unknown/missing `event_type` is stored (as `''` if missing) and inert; an unparseable `occurred_at` is stored as NULL: the event still dedupes, links and counts for orphan/unknown stats, but with no time it can never create/date a call or decide an effective disposition | Never lose a valid event; can't order what has no time | Count as malformed |
 | Phone is always required for a lead even if a schema marks it optional | Identity is `(workflow, phone)` | Reject only if `required` |
 | Required non-phone field present-but-invalid → reject `invalid_value:<field>` | Spec defines no reason; unreachable with shipped schemas | Treat as null (would create ref-less leads) |
 | Duplicate header after normalisation: first matching column wins | Deterministic | Error / last wins |
@@ -73,38 +80,70 @@ Tests scan the raw `.db`/`-wal` bytes for every generated name/phone.
 | An unknown `leads/<workflow>/` folder aborts the run before anything is ingested | Avoids partial, order-dependent state | Skip with warning |
 
 ## Failure modes considered
-- **Dirty rows:** every case in the spec's "messy" list is covered by rule tests and by differential tests on 14 seeds.
+- **Dirty rows:** every case in the spec's "messy" list is covered by rule tests and by differential tests on many seeds (see Testing).
 - **Crash / kill mid-run:** per-file transactions; tested with an injected exception after the inserts, and with a real `kill` of the CLI process; re-run converges to the same reports and `PRAGMA integrity_check` is `ok`.
 - **Re-runs:** identical files skipped (no audit row either); duplicate events across drops dropped by `event_id`; reports regenerate byte-identically.
 - **Wrong/missing keys, tampered DB:** exit 2 on missing/invalid keys or key mismatch; GCM tag failure → exit 1.
 - **Bad files:** empty files, non-UTF-8 CSV (rejected, nothing ingested), binary garbage in JSONL (counted malformed).
-- **Not handled / known gaps:** one writer at a time (SQLite; others wait up to 30 s); a *changed* file with the same name is simply ingested as new data (no "amended file" workflow); event `payload` is stored verbatim so free-text PII there would be stored; SQLite file itself is not encrypted; no Postgres path; `ingest_runs` rows left `running` mean a killed process.
+- **Not handled / known gaps:** verified on Windows 11 only (Linux/macOS commands not run); on Windows PowerShell 5.1 `gen-keys > .env` writes a UTF-8 BOM the `.env` loader rejects - use `| Out-File -Encoding ascii .env` (documented; loader not changed); one writer at a time (SQLite; others wait up to 30 s); a *changed* file with the same name is simply ingested as new data (no "amended file" workflow); event `payload` is stored verbatim so free-text PII there would be stored; SQLite file itself is not encrypted; no Postgres path; `ingest_runs` rows left `running` mean a killed process.
 
 ## Testing
-`pytest` → **145 passed** (~30 s, Python 3.11.9, also re-run in a fresh venv built from `solution/requirements.txt`).
-- `tests/oracle.py`: independent re-implementation of the spec (shares no code, different parsing mechanics). Differential tests compare all five files byte-for-byte on seeds 42, 7, 2026, 31337 (incremental), 42 and 7 (one-shot == incremental); outside pytest I also ran 10 more seeds (1, 2, 3, 99, 12345, 777, 2024, 5, 8675309, 0) and the `--scale large` seed 42 — all identical.
-- Rule tests: phone/date/decimal/header/timestamp tables, rejection ordering, blank-row numbering, merge semantics, overrides, buckets, IST rollover, orphans-before-leads, unknown dispositions, malformed/duplicate counters.
+`pytest` -> **155 passed** (6 files; counts per file: normalise 74, ledger rules 27, robustness 20, lead rules 15,
+security/CLI 13, differential 6). Python 3.11.9. The same 155 tests also pass in a clean copy of the repo with a fresh venv built from
+`solution/requirements.txt` (Windows PowerShell; 67 s), after running the documented commands there.
+- `tests/oracle.py`: independent re-implementation of the spec (shares no code, different parsing mechanics).
+  Differential tests compare all five files byte-for-byte on seeds 42, 7, 2026, 31337 (incremental) and 42, 7
+  (one-shot == incremental).
+- `solution/tools/verify_seeds.py` (new): for each fresh seed checks incremental == one-shot == oracle, re-ingest is
+  a no-op and reports are stable. Run after the review fixes: seeds 101, 202, 303, 404, 505, 606, 707, 808, 909,
+  31415 (small, 10/10 pass) and 4242 (`--scale large`, 133,031 leads, pass); after review round 3: 1111-8888 step 1111
+  (8/8 pass, both in the working tree and in the clean copy). Before the fixes I also ran 1, 2, 3, 99,
+  12345, 777, 2024, 5, 8675309, 0 and large seed 42 against the then-oracle; after the fixes the large seed 42 reports
+  are again byte-identical to the updated oracle and `data_quality.json` is unchanged.
+- Rule tests: phone/date/decimal/header/timestamp tables, rejection ordering, blank-row numbering, merge semantics,
+  overrides, buckets, IST rollover, orphans-before-leads, unknown dispositions, malformed/duplicate counters.
 - Robustness/security/CLI as listed above.
-- I mutation-checked key rules (override precedence, `any` vs `all` telephony failure, the `91`/`0` phone prefixes); one surviving mutant exposed a missing test, which I added.
+- Mutation checks run by hand during development (not part of the repo): override precedence, `any` vs `all` telephony
+  failure, `91`/`0` phone prefixes; one surviving mutant exposed a missing test, which was added.
+- **Review round 2 (defects found and fixed, with regression tests):** (1) every phone-less event used to link via
+  `call_id` - now only `disposition.override` does; (2) a call's lead was `MIN(lead_id)` over its events, inconsistent
+  with "earliest `call.initiated`" - now one rule for linking and attribution; (3) missing `event_type` / bad
+  `occurred_at` were counted malformed - now only bad JSON / no `event_id`. Four of the six new tests fail on the
+  previous commit (the other two are guards that pass on both). The test oracle had made the same wrong reading as the
+  pipeline in (1)-(3), so it was corrected too; that is a limit of an oracle written by the same author. These changes did
+  not alter any count on the generator's data (it never produces such events).
+- **Review round 3:** `call_lead` still gave an untimed `call.initiated` priority over timed events of another lead; an
+  untimed initiated is now treated as an ordinary (last-ranked) event. Regression test fails on the previous SQL; three guard
+  tests cover timed-initiated precedence, `event_id` tie-breaks and workflow isolation.
 - **Not tested:** Postgres; concurrent writers; multi-GB inputs.
 
 ## Results
-Windows 11 laptop, Python 3.11.9, SQLite 3.45.1, `--seed 42 --scale large` (143,990 lead rows, 632,602 event lines, 144 MB), fresh DB:
+Windows 11 laptop, Python 3.11.9, SQLite 3.45.1, `--seed 42 --scale large` (143,990 lead rows, 632,602 event lines,
+144 MB), fresh DB each time. Timing on this machine is **noisy**; three measurement sessions are reported as measured:
 
-| Step | Wall time | Peak RSS |
-|---|---|---|
-| `ingest drop_1` (106,748 lead rows + 308,063 events) | 20.3 s | 229 MB |
-| `ingest drop_2` (37,242 lead rows + 324,539 events) | 27.8 s | 336 MB |
-| `report` (all five files) | 12.9 s | 368 MB |
-| **Total** | **≈ 61 s** (< 2 min target) | |
-| re-ingest both drops (all skipped; dominated by hashing 144 MB) | 5.1 s | |
+| Step | A (early) | B (after review 2) | C (final code, after review 3) | Peak RSS |
+|---|---|---|---|---|
+| `ingest drop_1` (106,748 lead rows + 308,063 events) | 20.3 s | 64.2 s | 48.2 s | 230 MB |
+| `ingest drop_2` (37,242 lead rows + 324,539 events) | 27.8 s | 63.4 s | 74.6 s | 337 MB |
+| `report` (all five files) | 12.9 s | 18.6 s | 26.8 s | 367 MB |
+| **Total** | **~61 s** | **~146 s** | **~150 s** | |
+| re-ingest both drops (all skipped; hashing 144 MB) | 5.1 s | 7.7 s | 12.4 s | 268 MB |
 
-DB size 161 MB. First attempt was 73 s / 141 s / 27 s: profiling showed the two secondary indexes on `events` and a full orphan recount per run dominated; both were removed/made cheap (a recount now only runs when something new was ingested).
-Things in the data worth knowing: after drop 1 there were 87,444 orphan events and 34,424 after drop 2 (53,020 resolved by late-arriving leads; the rest belong to rejected leads, unparseable phones and never-uploaded numbers); 1,005 unknown-disposition events; 631 malformed lines; 18,490 duplicate event lines (cross-drop included).
+**Honest reading:** the < 2 min stretch goal was met in session A and **not** met in B or C. The code path is the same
+or slightly cheaper (an A/B of the report step on one DB gave 18.4 s for the review-2 SQL vs 21.3 s for the earlier SQL), and
+the pure-Python test oracle went from 26 s (A) to 114 s (B) to 56 s (C) on identical data, which points at machine load rather
+than the code - but I did not isolate the cause, so I do not claim the target on a typical run. Peak memory is stable
+(~230-370 MB). Final-code reports for this dataset are byte-identical to the oracle. DB size 161 MB.
+First attempt was 73 s / 141 s / 27 s: the two secondary indexes on `events` and a full orphan recount per run dominated;
+both were removed/made cheap (a recount now only runs when something new was ingested).
+Things in the data worth knowing: after drop 1 there were 87,444 orphan events and 34,424 after drop 2 (53,020 resolved by
+late-arriving leads; the rest belong to rejected leads, unparseable phones and never-uploaded numbers); 1,005
+unknown-disposition events; 631 malformed lines; 18,490 duplicate event lines (cross-drop included).
 
 ## If I had another day
 1. Postgres backend + migrations (Alembic) and a concurrency test with two writers.
 2. "Amended file" policy (same name, new bytes): diff-and-apply instead of treating as new data.
 3. Property-based tests (hypothesis) for the normalisers and for merge order-independence.
 4. Production notes for 100k leads/day: a scheduler running `ingest` per delivered drop (idempotent, so safe to retry), alerting on non-zero exit and on `ingest_runs.status='running'` older than N minutes, `report` per morning, backfills = re-ingest into a scratch DB and diff reports, and key rotation by re-encrypting `lead_fields` (the HMAC key is the harder one: rotation means rehashing all phones, which needs the encrypted copy).
-5. Incremental report maintenance (aggregate only dates/leads touched by new events) instead of a full 13 s recompute.
+5. Incremental report maintenance (aggregate only dates/leads touched by new events) instead of a full 13-27 s recompute.
+6. Make the `.env` loader tolerate a UTF-8 BOM, and run the suite on Linux/macOS.
